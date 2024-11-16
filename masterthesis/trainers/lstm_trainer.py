@@ -1,38 +1,46 @@
 from datetime import datetime
 import os
-import re
 from typing import Any, Dict, Tuple
 
-from datasets import DatasetDict
-import evaluate
-import numpy as np
 import psutil
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from transformers import AdamW, AutoTokenizer, DataCollatorForSeq2Seq, get_scheduler
+import evaluate
+import numpy as np
 from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from datasets import DatasetDict
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 import torch.distributed as dist
+from transformers import get_scheduler
 from colorama import Fore, Style
 
-from data import get_dataset
-from models import DistillBartSummarizer
+from models import encode, LSTMExtractor
 from logger import Logger, LoggerKeys, Colors, Mapping, DurationFormats
+from data.helpers import get_dataset
 
-
-class Trainer():
-    def __init__(self, config:Dict[str, Any]):
-        print(f'{Fore.LIGHTBLUE_EX}Initializing trainer{Style.RESET_ALL}')
+class LSTMTrainer():
+    def __init__(self, config:Dict[str, Any]) -> None:
         self.config = config
 
-        # Eval settings
+        #Sbert settings
+        self.sbert_model_name = config['sbert_model']
+        self.stransformer = SentenceTransformer(self.sbert_model_name)
+
+        # Model settings
+        self.distance_metric = config['distance_metric']
+        self.input_size = config['input_size']
+        self.hidden_size = config['hidden_size']
+        self.top_k = config['extract_top_k']
         self.val_steps = config['val_steps']
-        self.retokenize = config['retokenize']
         self.metric = config['metric']
+        self.use_batch_norm = config['use_batch_norm']
+        self.use_layer_norm = config['use_layer_norm']
+        self.activation_function = config['activation']
+        self.dropout = config['dropout']
         self.best_r1 = 0
 
-        # Logging       
+        # Logging settings
         self.writer = SummaryWriter()
         self.field_mapping = [
             Mapping(LoggerKeys.DURATION, 'Tick Duration', '', DurationFormats.MinutesSeconds, 7, Colors.LIGHTMAGENTA_EX),
@@ -58,14 +66,6 @@ class Trainer():
         self.log_steps = config['log_steps']
         self.logger = Logger(self.writer, self.field_mapping, header_frequency=int(self.val_steps/self.log_steps), avg_window=10)
 
-        # Model settings
-        self.max_length = config['max_length']
-        self.checkpoint = config['base_model']
-        self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint)
-        self.attention_window = config['attention_length']
-        self.model = DistillBartSummarizer(self.checkpoint, self.max_length, config['generate_max_length'], 
-                                        config['local_attention'], config['attention_length'])
-
         # Training settings
         self.dataset_name = config['dataset']
         self.dataset_prefix = config['dataset_prefix']
@@ -79,84 +79,69 @@ class Trainer():
         self.scheduler_type = config['scheduler_settings']['scheduler_type']
         self.warmup_steps = config['scheduler_settings']['warmup_steps']
 
-        #AMP Settings
-        self.use_amp = config['use_amp']
+        #Distributed settings
         self.local_rank = config['local_rank']
-        if self.use_amp:
-            #only import apex if needed
-            from apex import amp
-            
-            
-            self.optimization_level = config['optimization_level']      
-            self.keep_batchnorm_fp32 = config['keep_batchnorm_fp32']
-            self.loss_scale = config['loss_scale']
         self.distributed = config['distributed']
-        if self.distributed:
-            from apex.parallel import DistributedDataParallel, convert_syncbn_model
-            
-            self.sync_bn = config['sync_bn']
-            
         self.world_size = config['world_size']
-        self.train_sampler = None
 
-        if  'weights' in config.keys():
+        self.create_model()
+
+        if config['weights'] is not None:
             self.weight_path = config['weights']
             self.load()
-        
-        if 'text_rank_settings' in config:
-            self.text_rank_config = config['text_rank_settings']
-        else:
-            self.text_rank_config = None
-        
-        if 'lstm_settings' in config:
-            self.lstm_config = config['lstm_settings']
-        else:
-            self.lstm_config = None
 
-    
+    def create_model(self):
+        self.model = LSTMExtractor(self.distance_metric, self.input_size, self.hidden_size, self.use_batch_norm, self.use_layer_norm, self.dropout, self.activation_function)
+
+    def save(self):
+        directory = self.writer.get_logdir()
+        dic = {
+                "config": self.config,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+            }
+        torch.save(
+            dic, os.path.join(directory, "summarizer.h5")
+        ) 
+
+    def load(self):
+        dic = torch.load(self.weight_path)
+        self.model = LSTMExtractor.load(self.weight_path)
+        self.optimizer.load_state_dict(dic['optimizer_state_dic'])
+        self.lr_scheduler.load_state_dict(dic['lr_scheduler_state_dict'])
+
     def get_loaders(self, ds: DatasetDict) -> Tuple[DataLoader, DataLoader]:
-        data_collator = DataCollatorForSeq2Seq(self.tokenizer, model=self.model.inner_bart, return_tensors="pt", pad_to_multiple_of=self.attention_window)
-
-        if self.distributed:
-            self.train_sampler = DistributedSampler(ds['train'])
-
         train_loader = DataLoader(ds['train'], 
-                                  shuffle=(self.train_sampler is None), 
-                                  batch_size=self.batch_size, 
-                                  pin_memory=True, 
-                                  sampler=self.train_sampler,
-                                  collate_fn=data_collator)
+                                  shuffle=True, 
+                                  batch_size=1, 
+                                  pin_memory=True)
 
         val_loader = DataLoader(ds['val'].select(range(500)), 
-                                batch_size=1, 
-                                collate_fn=data_collator)
+                                batch_size=1)
 
         return (train_loader, val_loader)
-
-    def eval(self, ds: DataLoader, i: int) -> None:
+    
+    def eval(self, ds: DatasetDict, i: int) -> None:
         # When distributed evaluate only on rank 0
         if self.local_rank not in [-1, 0]:
             dist.barrier()
             return
         
         model = self.model
-        if self.distributed:
-            model = self.model.module
+        # if self.distributed:
+        #     model = self.model.module
 
-        data = iter(ds)
+        data = iter(ds['val'].select(range(500)))
         rouge = evaluate.load('rouge')
         summaries = []
         abstracts = []
         with torch.no_grad():
             model.eval()
             for batch in tqdm(data, "Evaluating: "):
-                input_ids = batch['input_ids'].cuda()
-                att_masks = batch['attention_mask'].cuda()
-                res = model.inner_bart.generate(inputs=input_ids, attention_mask=att_masks).cpu()
-                labels = batch["labels"].numpy()
-                labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)                
-                summaries.extend([' .\n'.join(x.split('.')) for x in self.tokenizer.batch_decode(res, skip_special_tokens=True)])
-                abstracts.extend([' .\n'.join(x.split('.')) for x in self.tokenizer.batch_decode(labels, skip_special_tokens=True)])
+                res = model.extract_text(batch['text'], self.stransformer, self.top_k)             
+                summaries.append(' .\n'.join(res.split('.')))
+                abstracts.append(' .\n'.join(batch['abstract'].split('.')))
                 
             self.writer.add_text('Summary[0]', summaries[0], i)
             results = rouge.compute(predictions=summaries, references=abstracts, use_stemmer=True)
@@ -176,31 +161,8 @@ class Trainer():
         if self.local_rank == 0 and self.distributed:
             dist.barrier()
 
-    def save(self):
-        directory = self.writer.get_logdir()
-        dic = {
-                "config": self.config,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
-            }
-        if self.use_amp:
-            dic["amp_state_dict"] = amp.state_dict()
-        torch.save(
-            dic, os.path.join(directory, "summarizer.h5")
-        )        
-
-    def load(self):
-        dic = torch.load(self.weight_path)
-        self.model.load_state_dict(dic['model_state_dict'])
-        self.optimizer.load_state_dict(dic['optimizer_state_dic'])
-        self.lr_scheduler.load_state_dict(dic['lr_scheduler_state_dict'])
-
-        if self.use_amp and 'amp_state_dict' in dic:
-            amp.load_state_dict(dic['amp_state_dict'])
-
     def train(self):
-        # Only first should prepare 
+         # Only first should prepare 
         if self.distributed:
             torch.cuda.set_device(self.local_rank)
         
@@ -208,29 +170,17 @@ class Trainer():
 
         if self.local_rank not in [-1, 0]:
             dist.barrier()
-            ds = get_dataset(self.dataset_name, self.checkpoint, self.max_length, False, self.dataset_prefix, self.text_rank_config, self.lstm_config)
+            ds = get_dataset(self.dataset_name, None, -1, False, self.dataset_prefix, None, 'lstm')
         else:
-            ds = get_dataset(self.dataset_name, self.checkpoint, self.max_length, self.retokenize, self.dataset_prefix, self.text_rank_config, self.lstm_config)
+            ds = get_dataset(self.dataset_name, None, -1, False, self.dataset_prefix, {'model_name': self.sbert_model_name}, 'lstm')
+            ds_eval = get_dataset(self.dataset_name, None, -1, False, self.dataset_prefix, None, 'lstm')
 
         if self.local_rank == 0 and self.distributed:
             dist.barrier()
         
-        ds.set_format('torch', columns=['input_ids', 'attention_mask', 'labels'])
+        ds.set_format('torch', columns=['embeddings', 'target'])
         dl_train, dl_eval = self.get_loaders(ds)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
-        
-        
-
-        if self.use_amp:
-            self.model, self.optimizer = amp.initialize(self.model, 
-                                                        self.optimizer, 
-                                                        opt_level=self.optimization_level, 
-                                                        keep_batchnorm_fp32=self.keep_batchnorm_fp32)
-
-        if self.distributed:
-            if self.sync_bn:
-                self.model = convert_syncbn_model(self.model)
-            self.model = DistributedDataParallel(self.model, delay_allreduce=True)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
         self.lr_scheduler = get_scheduler(
             self.scheduler_type,
@@ -238,16 +188,14 @@ class Trainer():
             num_warmup_steps=self.warmup_steps,
             num_training_steps=self.max_steps,
         )
+
         i = 0
         self.start_timestamp = datetime.now()
         print(f"Pre-trainig eval {Fore.YELLOW}(baseline){Style.RESET_ALL}")
-        self.eval(dl_eval, i)
+        self.loss_fct = torch.nn.MSELoss()
+        #self.eval(ds_eval, i)
         epoch = 0
-        if self.distributed:
-                self.train_sampler.set_epoch(epoch)
-        self.model.train()
         iterable = iter(dl_train)
-            
         while True:
             torch.cuda.empty_cache()
             self.model.train()
@@ -265,14 +213,12 @@ class Trainer():
                     i += 1
                     # info = batch['id']
                     # batch.pop('id')
-                    batch = {k: v.cuda() for k, v in batch.items()}
-                    outputs = self.model(**batch, return_dict=True)
-
-                    if self.use_amp:
-                        with amp.scale_loss(outputs.loss, self.optimizer) as scaled_loss:
-                            scaled_loss.backward()
-                    else:
-                        outputs.loss.backward()
+                    #batch = {k: v.cuda() for k, v in batch.items()}
+                    input = torch.stack(batch['embeddings'], dim=1)
+                    outputs = self.model(input.cuda())
+                    loss = self.loss_fct(outputs, torch.Tensor(batch['target']).cuda())
+                    loss.backward()
+                    
                         
                     self.optimizer.step()
                     self.lr_scheduler.step()
@@ -281,15 +227,14 @@ class Trainer():
                     if (j+1) % self.log_steps == 0:
                         self.logger.add_value('gpu', self.local_rank)
                         self.logger.add_value('lr', self.lr_scheduler.get_last_lr()[-1])
-                        self.logger.add_value('loss', outputs.loss)
+                        self.logger.add_value('loss', loss)
                         self.logger.add_value('ram', psutil.virtual_memory().used / (1024*1024*1024))
                         self.logger.step(i)
                 except RuntimeError:
                     print(info)
                     raise RuntimeError
             
-            self.eval(dl_eval, i)
+            self.eval(ds_eval, i)
 
             if i >= self.max_steps or self.evals_since_best == self.early_stopping_value:
                 break
-

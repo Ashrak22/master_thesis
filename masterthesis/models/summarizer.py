@@ -1,3 +1,4 @@
+from __future__ import annotations
 from threading import local
 from typing import List, Optional, Tuple, Union
 
@@ -21,16 +22,19 @@ class DistillBartSummarizer(Module):
         ):
         super(DistillBartSummarizer, self).__init__()
         self.inner_bart = BartForConditionalGeneration.from_pretrained(checkpoint)
-        #self.inner_bart.gradient_checkpointing_enable()
+        self.checkpoint = checkpoint
+        self.inner_bart.gradient_checkpointing_enable()
         self.config = self.inner_bart.config
         self.max_tokens = max_tokens
         self.config.max_length = generate_max_length
         self.attention_window = attention_window
-        # if max_tokens > self.config.max_position_embeddings:
-        #     self.expand_positional_embedding()
+        if max_tokens > self.config.max_position_embeddings:
+            self.expand_positional_embedding()
         
-        # if local_attention:
-        #     self.swap_attention()
+        if local_attention:
+            self.swap_attention()
+        self.config = self.inner_bart.config
+        self.config.max_position_embeddings = max_tokens
 
     def swap_attention(self):
         """
@@ -74,12 +78,19 @@ class DistillBartSummarizer(Module):
         previous_max_length = self.inner_bart.config.max_position_embeddings
         self.config.max_position_embeddings = self.max_tokens
         encoder_embeddings = self.inner_bart.model.encoder.embed_positions
+        decoder_embeddings = self.inner_bart.model.decoder.embed_positions
         self.inner_bart.model.encoder.embed_positions = BartLearnedPositionalEmbedding(
             self.max_tokens,
             self.config.d_model
         )
 
+        self.inner_bart.model.decoder.embed_positions = BartLearnedPositionalEmbedding(
+            self.max_tokens,
+            self.config.d_model
+        )
+
         self.inner_bart.model.encoder.embed_positions.weight.requires_grad = False
+        self.inner_bart.model.decoder.embed_positions.weight.requires_grad = False
         pos = 0
         length = previous_max_length+2
         flip = False
@@ -88,8 +99,10 @@ class DistillBartSummarizer(Module):
                 end = min(pos+length, self.max_tokens+2)
                 if flip:
                     self.inner_bart.model.encoder.embed_positions.weight[pos:end,:] = torch.flip(encoder_embeddings.weight, [0])[:end-pos, :]
+                    self.inner_bart.model.decoder.embed_positions.weight[pos:end,:] = torch.flip(decoder_embeddings.weight, [0])[:end-pos, :]
                 else:
                     self.inner_bart.model.encoder.embed_positions.weight[pos:end,:] = encoder_embeddings.weight[:end-pos, :]
+                    self.inner_bart.model.decoder.embed_positions.weight[pos:end,:] = decoder_embeddings.weight[:end-pos, :]
                 
                 pos += length
                 if length == previous_max_length+2:
@@ -97,7 +110,8 @@ class DistillBartSummarizer(Module):
                 flip = not flip
                 
         self.inner_bart.model.encoder.embed_positions.weight.requires_grad = True
-        print('positional ncoding expanded to {}'.format(self.max_tokens))
+        self.inner_bart.model.decoder.embed_positions.weight.requires_grad = True
+        print('Positional encoding expanded to {}'.format(self.max_tokens))
         pass
 
     def forward(self, 
@@ -140,3 +154,17 @@ class DistillBartSummarizer(Module):
     def generate(self, input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None):
         return self.inner_bart.generate(input_ids=input_ids, attention_mask=attention_mask)
+    
+    @classmethod
+    def load(cls, path: str) -> DistillBartSummarizer:
+        dic = torch.load(path)
+        config = dic['config']
+        max_tokens = config['max_length']
+        checkpoint = config['base_model']
+        generate_max_length = config['generate_max_length']
+        local_attention = config['local_attention']
+        attention_window = config['attention_length']
+
+        model = cls(checkpoint, max_tokens, generate_max_length, local_attention, attention_window)
+        model.load_state_dict(dic['model_state_dict'])
+        return model
