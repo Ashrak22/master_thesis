@@ -3,7 +3,7 @@ MediQA/
 pubmed/
 ma/
 ds/
-ma-venv/
+ma-env/
 runs/
 .venv/
 .cache/
