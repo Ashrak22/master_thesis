@@ -1,0 +1,12 @@
+2022-04-28/
+MediQA/
+pubmed/
+ma/
+ds/
+ma-venv/
+runs/
+.venv/
+.cache/
+**/__pycache__
+**/*.egg-info
+**/runs
