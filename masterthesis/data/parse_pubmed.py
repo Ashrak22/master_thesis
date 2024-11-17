@@ -5,6 +5,7 @@ import timeit
 import difflib
 import datasets
 import psutil
+import shutil
 from datasets import Dataset, load_dataset
 from datasets.dataset_dict import DatasetDict
 from transformers import AutoTokenizer
@@ -46,42 +47,47 @@ def _pubmed_dataset(tokenizer_name: str = "sshleifer/distilbart-cnn-12-6", max_l
             print('embedding for LSTM')
             sbert = SentenceTransformer(text_rank_config['model_name'])
             ds = ds.map(lambda x: _embed_sentences(x, sbert), batched=True)
-            ds.save_to_disk(ds_path)
+            changed = True
     
     if lstm_config is not None and 'use_lstm' in lstm_config and lstm_config['use_lstm']:
         if 'preselect_raw' not in ds['train'].column_names or lstm_config['recalculate_lstm']:
             print('calculating LSTM')
             model = LSTMExtractor.load(lstm_config['path']).cuda()
             ds = ds.map(lambda x: _calculate_lstm(x, model), batched=True)
-            ds.save_to_disk(ds_path)
+            changed = True
 
     if (lstm_config is not None and 'use_lstm' in lstm_config and lstm_config['use_lstm']) or (text_rank_config is not None and 'use_text_rank' in text_rank_config and text_rank_config['use_text_rank']):
+        print('using pre-select')
         config = lstm_config if lstm_config is not None and lstm_config['use_lstm'] else text_rank_config
         if config is not None and 'text_summary' not in ds['train'].column_names or config['reselect_top_k']:
             print('preselecting Top K sentences')
             ds = ds.map(lambda x: _calculate_top_k(x, config['top_k_sentences']), batched=True)
-            ds.save_to_disk(ds_path)
-        
-        if 'input_ids' not in ds['train'].column_names or retokenize:
-            print('tokenizing for BART')
-            use_preselect = False if config is None else (config['use_lstm'] if 'use_lstm' in config else config['use_textrank']) 
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-            ds = ds.map(lambda x: _tokenize(x, tokenizer, max_length, use_preselect), batched=True)
             changed = True
+        
+    if 'input_ids' not in ds['train'].column_names or retokenize:
+        print('tokenizing for BART')
+        use_preselect = False if config is None else (config['use_lstm'] if 'use_lstm' in config else config['use_text_rank']) 
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        ds = ds.map(lambda x: _tokenize(x, tokenizer, max_length, use_preselect), batched=True)
+        changed = True
         
 
     if type == 'lstm':
         if 'embedded_abstract' not in ds['train'].column_names:
             sbert = SentenceTransformer(text_rank_config['model_name'])
             ds = ds.map(lambda x: _embed_abstract(x, sbert), batched=True)
-            ds.save_to_disk(ds_path)
+            changed = True
         
         if 'target' not in ds['train'].column_names:
             ds = ds.map(lambda x: _calculate_targets(x), batched=True)
-            ds.save_to_disk(ds_path)
+            changed = True
 
     if changed:
-        ds.save_to_disk(ds_path)
+        ds.save_to_disk(ds_path+'temp')
+        del ds
+        shutil.rmtree(ds_path)
+        os.rename(ds_path+'temp', ds_path)
+        ds = datasets.load_from_disk(ds_path)
     return ds
 
     

@@ -7,6 +7,8 @@ from sentence_transformers import SentenceTransformer, util
 
 def encode(text:str, model:SentenceTransformer) -> Tuple[List[str], torch.Tensor]:
     sentences = [s.lower().strip() for s in sent_tokenize(text)]
+    # TODO: Catch that punkt is not downloaded ba catching LookupError
+    # nltk.download('punkt_tab')
     if len(sentences) < 1:
         print(text)
         return sentences, torch.from_numpy(np.zeros((1,1)))

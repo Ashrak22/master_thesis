@@ -1,0 +1,14 @@
+normal distillbart
+R1: 0.4143
+R2: 0.1647
+RL: 0.2425
+
+Local Attention 1024
+R1: 0.4413
+R2: 0.179
+RL: 0.2574
+
+Local Attention 4096
+R1:0.4522
+R2: 0.191
+rL: 0.2642

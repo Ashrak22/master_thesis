@@ -1,5 +1,6 @@
 from nltk import sent_tokenize
 from sentence_transformers import SentenceTransformer, util
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast 
 import torch
 
 from models import TextRank, LSTMExtractor
@@ -12,16 +13,17 @@ def _calculate_text_rank(examples, model: TextRank):
         summaries.append(model.textrank_raw(sentences=sentences, embeddings=embeddings))
     return {'preselect_raw': summaries}
 
-def _tokenize(examples, tokenizer, max_length: int, use_text_rank:bool = False):
+def _tokenize(examples, tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast, max_length: int, use_text_rank:bool = False):
     key = 'text_summary' if use_text_rank else 'text'
-    tokens = [tokenizer(example, max_length=max_length, truncation=True) for example in examples[key]]
+    tokens = [tokenizer(text=example, max_length=max_length, truncation=True, text_target=examples['abstract']) for example in examples[key]]
     tokens_length = [len(x['input_ids']) for x in tokens]
     token_list = [token['input_ids'] for token in tokens]
     attention_masks = [token['attention_mask'] for token in tokens]
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(examples['abstract'], max_length=max_length, truncation=True)
+    labels = [token['labels'] for token in tokens]
+    # with tokenizer.as_target_tokenizer():
+    #     labels = tokenizer(examples['abstract'], max_length=max_length, truncation=True)
 
-    return {"input_ids": token_list, 'attention_mask': attention_masks, 'labels': labels['input_ids'], 'lengths': tokens_length}
+    return {"input_ids": token_list, 'attention_mask': attention_masks, 'labels': labels, 'lengths': tokens_length}
 
 def _embed_sentences(examples, model: SentenceTransformer):
     sentences = []

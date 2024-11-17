@@ -5,26 +5,32 @@ import datasets
 from transformers import AutoTokenizer
 import torch
 
-from masterthesis.trainers.summarization_trainer import Trainer
+from masterthesis.trainers.lstm_trainer import LSTMTrainer
 
 config = {
-    'max_length': 4096,
-    'retokenize': True,
+    'sbert_model': "all-mpnet-base-v2", 
+    'distance_metric': "cosine_similarity",
+    'input_size': 768,
+    'hidden_size': 512,
+    'extract_top_k': 8,
+    'use_batch_norm': True,
+    'use_layer_norm': False,
+    'dropout': 0.2,
+    'activation': 'relu',
+    # -------
+    'log_steps': 500,
     'dataset': 'pubmed',
-    'base_model': 'sshleifer/distilbart-cnn-12-6',
+    'val_steps': 2000,
+    'metric': 'rouge',
+    'batch_size': 1,
+    'max_steps': 500000,
+    'early_stopping': 20,
     'dataset_prefix': None,
     'local_attention': True,
     'attention_length': 1024,
-    'metric': 'rouge',
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'batch_size': 4,
-    'max_steps': 500000,
-    'val_steps': 2000,
-    'log_steps': 500,
-    'early_stopping': 10,
-    'generate_max_length': 966,
+
     'optimizer_settings': {
-        'name': 'AdamW',
+        'name': 'Adam',
         'lr': 1e-5
     },
     'scheduler_settings': {
@@ -32,21 +38,6 @@ config = {
         'warmup_steps': 8000
     },
     'use_amp': False,
-    'text_rank_settings': {
-        'use_text_rank': True,
-        'model_name': "all-mpnet-base-v2", 
-        'similarity_function': "euclidean_distance",
-        'top_k_sentences': 70,
-        'reselect_top_k': True,
-        'recalculate_text_rank': False
-    },
-    'lstm_settings': {
-        'use_lstm': False,
-        'path': 'summarizer.h5',
-        'top_k_sentences': 70,
-        'reselect_top_k': True,
-        'recalculate_lstm': False
-    }
 }
 
 def parse():
@@ -65,21 +56,6 @@ def parse():
     parser.add_argument('--weights', type=str, default=None)
     args = parser.parse_args()
     return args
-
-
-def generate_summary(text: str, model: torch.nn.Module, tokenizer: AutoTokenizer, print_summaries: bool = False)  -> str:
-    tokens = tokenizer([text], truncation=True, max_length=2048, return_tensors='pt')
-    tokens['input_ids'] = tokens['input_ids'].to(config['device'])
-    tokens['attention_mask'] = tokens['attention_mask'].to(config['device'])
-    res = model.generate(tokens['input_ids'], tokens['attention_mask'])
-    #summary = res.logits.cpu().softmax(dim=2).argmax(dim=2)[0]
-    summary_text = tokenizer.decode(res.cpu())
-
-    if print_summaries:
-        print("==== Original Text ====\r\n", text)
-        print("==== Summary ====\r\n", summary_text)
-
-    return summary_text
 
 
 if __name__ == '__main__':
@@ -110,7 +86,6 @@ if __name__ == '__main__':
                                              init_method='env://')
         config['world_size'] = torch.distributed.get_world_size()
 
-
-    trainer = Trainer(config)
+    trainer = LSTMTrainer(config)
     trainer.train()
 

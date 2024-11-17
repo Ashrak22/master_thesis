@@ -44,7 +44,7 @@ class TextRank():
             reverse = True
             mat = util.dot_score(embeddings, embeddings).numpy()
 
-        graph = nx.from_numpy_matrix(mat)
+        graph = nx.from_numpy_array(mat)
         pr = nx.pagerank(graph, max_iter=20000)
         ranked_sentences = sorted(((pr[i], i,s) for i,s in enumerate(sentences)), reverse=reverse)
         ranked_sentences = list(zip(*ranked_sentences))

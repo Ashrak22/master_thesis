@@ -99,7 +99,7 @@ class Trainer():
         self.world_size = config['world_size']
         self.train_sampler = None
 
-        if  'weights' in config.keys():
+        if  config['weights'] is not None:
             self.weight_path = config['weights']
             self.load()
         
